@@ -7,7 +7,7 @@ from torch.utils.data import SubsetRandomSampler, DataLoader
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, f1_score
 from src.utils import *
-from src.models import load_model
+from src.models import load_model, group_lasso_penalty, group_lasso_penalty_last_layer
 from src.utils import args
 import optuna
 

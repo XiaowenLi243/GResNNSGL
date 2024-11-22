@@ -3,7 +3,7 @@ from src.utils import args
 from src.models import load_model
 from src.utils.load_data import load_data
 from src.utils import *
-from src.opt.training_pipeline import train_model, train_step, valid_step
+from src.opt.training_pipeline import train_model, train_step, valid_step,train_step_with_group_lasso
 import optuna
 import torch.optim as optim
 import pandas as pd
@@ -35,7 +35,6 @@ def single_run(seed):
     fix_random_seed(seed)
     indices_view1 = np.arange(len(data_1[0]))
     np.random.shuffle(indices_view1)
-
 
     # Create SubsetRandomSampler using the shuffled indices
     sampler_view1 = SubsetRandomSampler(indices_view1)
@@ -69,8 +68,9 @@ def single_run(seed):
         best_optimizer = getattr(optim, best_params['optimizer'])(best_model.parameters(), lr= best_params['learning_rate'])
 
     for epoch in range(best_params['epochs']):
-        train_stats = train_step(best_model, criterion, best_optimizer, train_loader)
-
+        train_stats = train_step_with_group_lasso(best_model, criterion, best_optimizer, train_loader, lambda_=best_params['lambda_group_lasso'])
+        print(f"Epoch {epoch + 1}, Group Norms: {train_stats['group_norms']}")
+        
     test_stats = valid_step(best_model, criterion, test_loader)
 
     print(f'Best hyperparameters for this split: {best_params}')

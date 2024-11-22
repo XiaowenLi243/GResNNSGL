@@ -239,6 +239,36 @@ def load_model(params, input_size_1, input_size_2, input_size_3, model_name=args
     model = model.to(args.device)
     return model
 
+
+def group_lasso_penalty(model, lambda_):
+    penalty = 0.0
+    # Define groups
+    groups = {
+        'block1': [model.block1[0].weight, model.block1[4].weight, model.block1[7].weight],  # Linear layers in block1
+        'block2': [model.block2[0].weight, model.block2[4].weight, model.block2[7].weight],  # Linear layers in block2
+        'block3': [model.block3[0].weight, model.block3[4].weight, model.block3[7].weight],  # Linear layers in block3
+    }
+    # Compute L2 norm for each group
+    for group_params in groups.values():
+        group_weights = torch.cat([param.flatten() for param in group_params])
+        penalty += torch.norm(group_weights, p=2)
+    return lambda_ * penalty
+
+def group_lasso_penalty_last_layer(model, lambda_):
+    penalty = 0.0
+    # Define groups (last layer weights from each block)
+    groups = {
+        'block1': [model.block1[-3].weight],  # Last linear layer in block1
+        'block2': [model.block2[-3].weight],  # Last linear layer in block2
+        'block3': [model.block3[-3].weight],  # Last linear layer in block3
+    }
+    # Compute L2 norm for each group
+    for group_params in groups.values():
+        group_weights = torch.cat([param.flatten() for param in group_params])
+        penalty += torch.norm(group_weights, p=2)
+    return lambda_ * penalty
+
+
 if __name__ == "__main__":
     pass
 

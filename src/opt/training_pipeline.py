@@ -85,6 +85,60 @@ def train_step(model, criterion, optimizer, train_loader):
 
     return {'loss': avg_loss / len(train_loader['omic1']), 'accuracy': avg_acc / y_label}
 
+def train_step_with_group_lasso(model, criterion, optimizer, train_loader, lambda_=0.01):
+    model.train()
+    avg_loss = 0.0
+    avg_acc = 0.0
+    total_labels = 0
+
+    # Storage for group norms
+    group_norms = {}
+
+    for (sample_1, labels_1), (sample_2, labels_2), (sample_3, labels_3) in zip(
+        train_loader['omic1'], train_loader['omic2'], train_loader['omic3']
+    ):
+        optimizer.zero_grad()
+
+        # Move data to the appropriate device
+        sample_1, labels_1 = sample_1.to(args.device), labels_1.to(args.device)
+        sample_2, labels_2 = sample_2.to(args.device), labels_2.to(args.device)
+        sample_3, labels_3 = sample_3.to(args.device), labels_3.to(args.device)
+
+        total_labels += labels_1.size(0)
+
+        # Forward pass
+        probs = model(sample_1, sample_2, sample_3)
+
+        # Compute loss
+        loss = criterion(probs, labels_1.squeeze(dim=1))
+
+        # Group Lasso penalty (L2 norm of weights of the last layers in each block)
+        lasso_penalty = (
+            lambda_ * torch.norm(model.block1[-3].weight, p=2)
+            + lambda_ * torch.norm(model.block2[-3].weight, p=2)
+            + lambda_ * torch.norm(model.block3[-3].weight, p=2)
+        )
+        total_loss = loss + lasso_penalty
+
+        # Backpropagation
+        total_loss.backward()
+        optimizer.step()
+
+        # Update statistics
+        avg_loss += total_loss.item()
+        _, preds = torch.max(probs, 1)
+        avg_acc += torch.sum(preds == labels_1.squeeze(dim=1)).item()
+
+    # Compute group norms for logging
+    group_norms['omic1'] = torch.norm(model.block1[-3].weight, p=2).item()
+    group_norms['omic2'] = torch.norm(model.block2[-3].weight, p=2).item()
+    group_norms['omic3'] = torch.norm(model.block3[-3].weight, p=2).item()
+
+    return {
+        'loss': avg_loss / len(train_loader['omic1']),
+        'accuracy': avg_acc / total_labels,
+        'group_norms': group_norms,
+    }
 
 def train_model(trial, seed):
     fix_random_seed(seed=seed)

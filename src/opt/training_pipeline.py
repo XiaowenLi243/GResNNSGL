@@ -140,6 +140,8 @@ def train_step_with_group_lasso(model, criterion, optimizer, train_loader, lambd
         'group_norms': group_norms,
     }
 
+
+
 def train_model(trial, seed):
     fix_random_seed(seed=seed)
     # define search space for tuning hyperparameters
@@ -156,7 +158,8 @@ def train_model(trial, seed):
                 'kernel_par_2': trial.suggest_categorical('kernel_par_2', [0.0005, 0.0007, 0.001]),
                 'kernel_par_3': trial.suggest_categorical('kernel_par_3', [0.0005, 0.0007, 0.001]), 
                 'n_principal': trial.suggest_categorical('n_principal', [120]),
-                'epochs': trial.suggest_int('epochs', 120, 200, step=10)
+                'epochs': trial.suggest_int('epochs', 120, 200, step=10),
+                'lambda_group_lasso': trial.suggest_categorical('lambda_group_lasso', [0.0001,0.001,0.01, 0.1]),
                 }
     else:
         
@@ -173,7 +176,8 @@ def train_model(trial, seed):
                 'kernel_par_2': trial.suggest_categorical('kernel_par_2', [0.00005,0.0005,0.005]),
                 'kernel_par_3': trial.suggest_categorical('kernel_par_3', [0.00005,0.0005,0.005]),
                 'n_principal': trial.suggest_int('n_principal', min_principal, max_principal, step=3),
-                'epochs': trial.suggest_int('epochs', 120, 200, step=10)
+                'epochs': trial.suggest_int('epochs', 120, 200, step=10),
+                'lambda_group_lasso': trial.suggest_categorical('lambda_group_lasso', [0.0001,0.001,0.01, 0.1]),
                 }
     # Check duplication and skip if it's detected.
     for t in trial.study.trials:
@@ -184,8 +188,6 @@ def train_model(trial, seed):
         if t.params == trial.params:
             raise optuna.exceptions.TrialPruned('Duplicate parameter set')
         
-
-
     data_1, data_2, data_3 = load_data(seed=seed, kernel_par = [params['kernel_par_1'],params['kernel_par_2'], params['kernel_par_3']],
                                        n_principal= params['n_principal'])
     #print(data_1[0][0])
@@ -237,7 +239,9 @@ def train_model(trial, seed):
             optimizer = getattr(optim, params['optimizer'])(model.parameters(), lr= params['learning_rate'])
 
         for epoch in range(params['epochs']):
-            train_stats = train_step(model, criterion, optimizer, train_loader)
+            train_stats = train_step_with_group_lasso(model, criterion, optimizer, train_loader,lambda_=params['lambda_group_lasso'])
+            print(f"Epoch {epoch + 1}, Fold {fold + 1}, Train Group Norms: {train_stats['group_norms']}")
+        
         valid_stats = valid_step(model, criterion, val_loader)
 
         scores_tr.append(train_stats['accuracy'])

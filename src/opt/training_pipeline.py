@@ -1,258 +1,272 @@
-import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import StratifiedKFold
 import torch.optim as optim
-from torch.utils.data import SubsetRandomSampler, DataLoader
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, f1_score
-from src.utils import *
-from src.models import load_model, group_lasso_penalty, group_lasso_penalty_last_layer
-from src.utils import args
 import optuna
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import SubsetRandomSampler
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import pearsonr
+from sklearn.metrics import mean_squared_error
+import os
+import pandas as pd
+from src.utils import args
+from src.utils import *
+from src.utils.utils import compute_adaptive_weights
+from src.models import load_model,sparse_group_lasso_loss
+from torch.optim import Optimizer
+from torch.optim import Adam
+from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
 
-def valid_step(model, criterion, val_loader):
-    model.eval()
-    soft = nn.Softmax(dim=1)
-    avg_loss = 0.0
-    avg_acc = 0.0
+def train(model, dataloader, optimizer, criterion, l1_lambda, l2_lambda, gene_groups, args, adaptive_weights=None):
+    model.train()
+    total_loss = 0
     y_pred = []
-    prediction = []
     y_label = []
-    with torch.no_grad():
-        for (sample_1, labels_1), (sample_2, labels_2), (sample_3, lables_3) in zip(val_loader['omic1'], val_loader['omic2'], val_loader['omic3']):
-            # forward pass
-            sample_1, labels_1, sample_2, sample_3 = sample_1.to(args.device), labels_1.to(args.device), sample_2.to(args.device), sample_3.to(args.device)
-            
-            outputs = model(sample_1, sample_2, sample_3)
 
-            # if needed when the batch size is 1
-            loss = criterion(outputs, labels_1.squeeze(dim=1))
-
-            #y_pred += outputs.squeeze().tolist()
-            prediction += (soft(outputs)).squeeze(dim=1).tolist()
-            y_label += labels_1.squeeze(dim=1).tolist()
-           
-            # gather statistics
-            avg_loss += loss.item()
-            _, preds = torch.max(outputs, 1)
-            y_pred += preds.tolist()
-            avg_acc += torch.sum(preds == labels_1.squeeze(dim=1)).item()
-
-    
-    if args.dataset == 'ROSMAP':
-        pred_proba = np.array(prediction)[:,1]
-        auc = roc_auc_score(np.array(y_label), pred_proba)
-        f1 = f1_score(np.array(y_label), np.array(y_pred))
-
-        return {'loss': avg_loss / len(val_loader['omic1']), 'accuracy': avg_acc / len(y_label), 'auc': auc, 'labels': y_label, 'pred': y_pred, 'f1':f1}
-    
-    else:
-        f1_mc = f1_score(np.array(y_label), np.array(y_pred), average='macro')
-        f1_we = f1_score(np.array(y_label), np.array(y_pred), average='weighted')
-
-        return {'loss': avg_loss / len(val_loader['omic1']), 'accuracy': avg_acc / len(y_label), 'labels': y_label, 'pred': y_pred, 'f1':[f1_mc,f1_we]}
-
-
-
-def train_step(model, criterion, optimizer, train_loader):
-    model.train()
-    avg_loss = 0.0
-    avg_acc = 0.0
-    y_label = 0
-    for (sample_1, labels_1), (sample_2, labels_2), (sample_3, lables_3) in zip(train_loader['omic1'], train_loader['omic2'], train_loader['omic3']):
+    for inputs, targets in dataloader:
+        inputs, targets = inputs.to(args.device), targets.to(args.device)
         optimizer.zero_grad()
-        # forward pass
-        sample_1, labels_1, sample_2, sample_3 = sample_1.to(args.device), labels_1.to(args.device), sample_2.to(args.device), sample_3.to(args.device)
-        y_label += labels_1.shape[0]
-
-        # prediction
-        probs = model(sample_1, sample_2, sample_3)
-        #print(probs)
-        # loss
-        loss = criterion(probs, labels_1.squeeze(dim=1))
-        #print(labels_1.squeeze(dim=1))
-        # back-prop
-        loss.backward()
-        optimizer.step()
-        
-        # gather statistics
-        avg_loss += loss.item()
-        #print(f'loss item {loss.item()}')
-        _, preds = torch.max(probs, 1)
-        avg_acc += torch.sum(preds == labels_1.squeeze(dim=1)).item()
-
-    return {'loss': avg_loss / len(train_loader['omic1']), 'accuracy': avg_acc / y_label}
-
-def train_step_with_group_lasso(model, criterion, optimizer, train_loader, lambda_=0.01):
-    model.train()
-    avg_loss = 0.0
-    avg_acc = 0.0
-    total_labels = 0
-
-    # Storage for group norms
-    group_norms = {}
-
-    for (sample_1, labels_1), (sample_2, labels_2), (sample_3, labels_3) in zip(
-        train_loader['omic1'], train_loader['omic2'], train_loader['omic3']
-    ):
-        optimizer.zero_grad()
-
-        # Move data to the appropriate device
-        sample_1, labels_1 = sample_1.to(args.device), labels_1.to(args.device)
-        sample_2, labels_2 = sample_2.to(args.device), labels_2.to(args.device)
-        sample_3, labels_3 = sample_3.to(args.device), labels_3.to(args.device)
-
-        total_labels += labels_1.size(0)
 
         # Forward pass
-        probs = model(sample_1, sample_2, sample_3)
+        outputs = model(inputs)
+        outputs = outputs.view(-1)
+        targets = targets.view(-1)
 
-        # Compute loss
-        loss = criterion(probs, labels_1.squeeze(dim=1))
+        # Base loss
+        base_loss = criterion(outputs, targets)
 
-        # Group Lasso penalty (L2 norm of weights of the last layers in each block)
-        lasso_penalty = (
-            lambda_ * torch.norm(model.block1[-3].weight, p=2)
-            + lambda_ * torch.norm(model.block2[-3].weight, p=2)
-            + lambda_ * torch.norm(model.block3[-3].weight, p=2)
+        # Penalty loss
+        penalty = sparse_group_lasso_loss(
+            model, 
+            l1_lambda, 
+            l2_lambda, 
+            gene_groups, 
+            penalty_type=args.penaltytype, 
+            adaptive_weights=adaptive_weights
         )
-        total_loss = loss + lasso_penalty
-
-        # Backpropagation
-        total_loss.backward()
+        
+        # Total loss
+        loss = base_loss + penalty
+        loss.backward()
         optimizer.step()
 
-        # Update statistics
-        avg_loss += total_loss.item()
-        _, preds = torch.max(probs, 1)
-        avg_acc += torch.sum(preds == labels_1.squeeze(dim=1)).item()
-
-    # Compute group norms for logging
-    group_norms['omic1'] = torch.norm(model.block1[-3].weight, p=2).item()
-    group_norms['omic2'] = torch.norm(model.block2[-3].weight, p=2).item()
-    group_norms['omic3'] = torch.norm(model.block3[-3].weight, p=2).item()
-
-    return {
-        'loss': avg_loss / len(train_loader['omic1']),
-        'accuracy': avg_acc / total_labels,
-        'group_norms': group_norms,
-    }
-
-
-
-def train_model(trial, seed):
-    fix_random_seed(seed=seed)
-    # define search space for tuning hyperparameters
-    if args.dataset == "ROSMAP":
-        min_principal = 180
-        max_principal = 200
-        params = { 
-                'learning_rate':trial.suggest_categorical('learning_rate', [5e-5]),
-                'weight_decay': trial.suggest_categorical('weight_decay',  [1e-4]),
-                'optimizer': trial.suggest_categorical("optimizer", ['Adam']),
-                'batch_size': trial.suggest_categorical('batch_size', [32]),
-                'dropout1': trial.suggest_categorical('dropout1', [0.5]),
-                'kernel_par_1': trial.suggest_categorical('kernel_par_1', [0.0005, 0.0007, 0.001]), #[0.0005, 0.0001, 0.00005] [0.0005, 0.0007, 0.001]
-                'kernel_par_2': trial.suggest_categorical('kernel_par_2', [0.0005, 0.0007, 0.001]),
-                'kernel_par_3': trial.suggest_categorical('kernel_par_3', [0.0005, 0.0007, 0.001]), 
-                'n_principal': trial.suggest_categorical('n_principal', [120]),
-                'epochs': trial.suggest_int('epochs', 120, 200, step=10),
-                'lambda_group_lasso': trial.suggest_categorical('lambda_group_lasso', [0.0001,0.001,0.01, 0.1]),
-                }
-    else:
+        total_loss += loss.item()
         
-        min_principal = 9
-        max_principal = 18
+        # Collect predictions and labels
+        y_pred.extend(outputs.detach().cpu().numpy())
+        y_label.extend(targets.detach().cpu().numpy())
+  
+    if args.task_type == 'binary_class':
+        y_pred_binary = [1.0 if p > 0.5 else 0.0 for p in y_pred]
+        accuracy = accuracy_score(y_label, y_pred_binary)
+        f1 = f1_score(y_label, y_pred_binary)
+        auc_roc = roc_auc_score(y_label, y_pred)
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'accuracy': accuracy,
+            'f1': f1,
+            'auc_roc': auc_roc
+        }
     
-        params = { 
-                'learning_rate':trial.suggest_categorical('learning_rate', [1e-4]),
-                'weight_decay': trial.suggest_categorical('weight_decay',  [0]),
-                'optimizer': trial.suggest_categorical("optimizer", ['Adam']),
-                'dropout1': trial.suggest_categorical('dropout1', [0.3]),
-                'batch_size': trial.suggest_categorical('batch_size', [32]),
-                'kernel_par_1': trial.suggest_categorical('kernel_par_1', [0.00005,0.0005,0.005]), 
-                'kernel_par_2': trial.suggest_categorical('kernel_par_2', [0.00005,0.0005,0.005]),
-                'kernel_par_3': trial.suggest_categorical('kernel_par_3', [0.00005,0.0005,0.005]),
-                'n_principal': trial.suggest_int('n_principal', min_principal, max_principal, step=3),
-                'epochs': trial.suggest_int('epochs', 120, 200, step=10),
-                'lambda_group_lasso': trial.suggest_categorical('lambda_group_lasso', [0.0001,0.001,0.01, 0.1]),
-                }
-    # Check duplication and skip if it's detected.
+    elif args.task_type == 'multi_class':
+
+        y_pred_multi = np.argmax(y_pred, axis=1)
+        accuracy = accuracy_score(y_label, y_pred_multi)
+        weighted_f1 = f1_score(y_label, y_pred_multi, average='weighted')
+        auc_roc = roc_auc_score(y_label, y_pred, multi_class='ovr', average='weighted')
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'accuracy': accuracy,
+            'weighted_f1': weighted_f1,
+            'auc_roc': auc_roc
+        }
+    
+    elif args.task_type == 'regression':
+        # Regression metrics
+        mse = mean_squared_error(y_label, y_pred)
+        correlation, _ = pearsonr(y_label, y_pred)
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'mse': mse,
+            'correlation': correlation
+        }
+    
+    
+def validate(model, dataloader, criterion, args):
+    model.eval()
+    total_loss = 0
+    y_pred = []
+    y_label = []
+
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs, targets = inputs.to(args.device), targets.to(args.device)
+            outputs = model(inputs)
+
+            outputs = outputs.view(-1)
+            targets = targets.view(-1)
+
+            loss = criterion(outputs, targets)
+            total_loss += loss.item()
+
+            y_pred.extend(outputs.detach().cpu().numpy())
+            y_label.extend(targets.detach().cpu().numpy())
+
+
+    if args.task_type == 'binary_class':
+        
+        y_pred_binary = [1 if p > 0.5 else 0 for p in y_pred] 
+        accuracy = accuracy_score(y_label, y_pred_binary)
+        f1 = f1_score(y_label, y_pred_binary)
+        auc_roc = roc_auc_score(y_label, y_pred) 
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'accuracy': accuracy,
+            'f1': f1,
+            'auc_roc': auc_roc
+        }
+    
+    elif args.task_type == 'multi_class':
+    
+        y_pred_multi = np.argmax(y_pred, axis=1)  
+        accuracy = accuracy_score(y_label, y_pred_multi)
+        weighted_f1 = f1_score(y_label, y_pred_multi, average='weighted')
+        auc_roc = roc_auc_score(y_label, y_pred, multi_class='ovr', average='weighted')
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'accuracy': accuracy,
+            'f1': weighted_f1,
+            'auc_roc': auc_roc
+        }
+    
+    elif args.task_type == 'regression':
+       
+        mse = mean_squared_error(y_label, y_pred)
+        correlation, _ = pearsonr(y_label, y_pred)
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'mse': mse,
+            'correlation': correlation
+        }
+    
+    
+def objective(trial, seed):
+    fix_random_seed(seed=seed)
+
+    if args.penaltytype in ['sparse_group_lasso', 'adaptive_sparse_group_lasso']:
+        params = {
+            'hidden1_size': trial.suggest_categorical('hidden1_size', [100]),
+            'hidden2_size': trial.suggest_categorical('hidden2_size', [100]),
+            'hidden3_size': trial.suggest_categorical('hidden3_size', [0]),
+            'learning_rate': trial.suggest_float('learning_rate', 0.008,0.5),
+            'lambda_lasso': trial.suggest_float('lambda_lasso', 1e-7, 1, log=True),  
+            'lambda_group': trial.suggest_float('lambda_group', 1e-8, 1, log=True), 
+            'weight_decay': trial.suggest_float('weight_decay',1e-8, 0.01, log=True), 
+            'dropout': trial.suggest_float('dropout', 0,0.5)
+        }
+        
+    elif args.penaltytype in ['group_lasso', 'adaptive_group_lasso']:
+        params = {
+            'hidden1_size': trial.suggest_categorical('hidden1_size', [100]),
+            'hidden2_size': trial.suggest_categorical('hidden2_size', [100]),
+            'hidden3_size': trial.suggest_categorical('hidden3_size', [0]),
+            'learning_rate': trial.suggest_categorical('learning_rate', [0.005]),
+            'weight_decay': trial.suggest_categorical('weight_decay', [0.00001, 0.0001, 0.001, 0.01, 0.1, 0.5]),
+            'lambda_lasso': trial.suggest_categorical('lambda_lasso', [0]),
+            'lambda_group': trial.suggest_categorical('lambda_group', [0.00001, 0.0001, 0.001, 0.01, 0.1, 1]),
+            'dropout': trial.suggest_categorical('dropout', [0.1, 0.2, 0.3, 0.4])
+        }
+
+    # Check for duplicate trials
     for t in trial.study.trials:
         if t.state != optuna.trial.TrialState.COMPLETE:
             continue
-        if 'best_epoch' in t.params.keys():
-            del t.params["best_epoch"]
         if t.params == trial.params:
-            raise optuna.exceptions.TrialPruned('Duplicate parameter set')
+            raise optuna.exceptions.TrialPruned("Duplicate parameter set")
+
+    # Load data
+    X_tr1, X_te, y_tr1, y_te, gene_groups = load_data(seed)
+
+    # Initialize 5-fold cross-validation
+    kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+    fold_val_losses = []
+    fold_metrics = []
+    best_epochs = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X_tr1)):
+        print(f"Fold {fold + 1}")
+
+        # Split data
+        X_tr, X_val = X_tr1[train_idx], X_tr1[val_idx]
+        y_tr, y_val = y_tr1[train_idx], y_tr1[val_idx]
         
-    data_1, data_2, data_3 = load_data(seed=seed, kernel_par = [params['kernel_par_1'],params['kernel_par_2'], params['kernel_par_3']],
-                                       n_principal= params['n_principal'])
-    #print(data_1[0][0])
-
-    # Loss function
-    criterion = nn.CrossEntropyLoss()
-
-    n_splits = 5
-    # define splits for the k-fold
-    splits= StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=1)
-
-    # scores of a configuration of hyperparameters on each fold
-    scores_tr = []
-    scores_val = []
-    #scores_per_epoch = {'train': np.zeros(n_epoch), 'val': np.zeros(n_epoch)}
-    for fold, (train_idx, val_idx) in enumerate(splits.split(data_1[0][:][0], data_1[0][:][1])):
-        fix_random_seed(seed=seed)
-        input_size_1, input_size_2, input_size_3 = data_1[0][0][0].shape[0], data_2[0][0][0].shape[0], data_3[0][0][0].shape[0]
-        model = load_model(params, input_size_1, input_size_2, input_size_3, args.model).to(args.device)
-
-        # sampling from omic1 (same observations for each omic)
-        np.random.shuffle(train_idx)
-        train_sampler = SubsetRandomSampler(train_idx)
-        #print(list(train_sampler))
-        valid_sampler = val_idx
-        kwargs = {} if args.device=='cpu' else {'num_workers': 2, 'pin_memory': True}
-        loader_kwargs = {**kwargs}
-
-        # omic1
-        train_loader_1 = DataLoader(data_1[0], **loader_kwargs, sampler= train_sampler, batch_size= params['batch_size'])
-        val_loader_1  = DataLoader(data_1[0], **loader_kwargs, sampler= valid_sampler, batch_size=params['batch_size'])  
-
-        # omic2
-        train_loader_2 = DataLoader(data_2[0], **loader_kwargs, sampler=train_sampler, batch_size=params['batch_size'])
-        val_loader_2  = DataLoader(data_2[0], **loader_kwargs, sampler= valid_sampler, batch_size=params['batch_size']) 
-
-        # omic3
-        train_loader_3 = DataLoader(data_3[0], **loader_kwargs, sampler=train_sampler, batch_size=params['batch_size'])
-        val_loader_3  = DataLoader(data_3[0], **loader_kwargs, sampler= valid_sampler, batch_size=params['batch_size']) 
-
-        # loader for each omic, train and validation
-        train_loader =  {'omic1': train_loader_1, 'omic2': train_loader_2, 'omic3': train_loader_3}
-        val_loader =  {'omic1': val_loader_1, 'omic2': val_loader_2, 'omic3': val_loader_3}
-
-        # define optimizer
-        if params['optimizer'] in ["Adagrad", "Adam", "AdamW", "SGD"]:
-            optimizer = getattr(optim, params['optimizer'])(model.parameters(), lr= params['learning_rate'], weight_decay=params['weight_decay'])
-        else:
-            optimizer = getattr(optim, params['optimizer'])(model.parameters(), lr= params['learning_rate'])
-
-        for epoch in range(params['epochs']):
-            train_stats = train_step_with_group_lasso(model, criterion, optimizer, train_loader,lambda_=params['lambda_group_lasso'])
-            print(f"Epoch {epoch + 1}, Fold {fold + 1}, Train Group Norms: {train_stats['group_norms']}")
+        # Create DataLoaders
+        train_loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=len(train_idx), shuffle=True)
+        val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=len(val_idx),shuffle=True)
         
-        valid_stats = valid_step(model, criterion, val_loader)
+        # Load model
+        model = load_model(params, gene_groups, args.model)
+        model = model.to(args.device)
+        optimizer = optim.Adam(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
+        
+        if args.task_type == 'regression':
+            criterion = nn.MSELoss()  
+        elif args.task_type == 'binary_class':
+            criterion = nn.BCEWithLogitsLoss()  
+        else:  
+            criterion = nn.CrossEntropyLoss()  
 
-        scores_tr.append(train_stats['accuracy'])
-        scores_val.append(valid_stats['accuracy'])
+        # Training loop with early stopping
+        epochs = 1000
+        patience = 10
+        best_val_loss = float("inf")
+        patience_counter = 0
+        best_epoch = 0
 
-    print(f'Train acc mean over folds: {np.mean(scores_tr)}, Train acc std {np.std(scores_tr)}')
-    print(f'Val acc mean over folds: {np.mean(scores_val)}, Val acc std {np.std(scores_val)}')
+        for epoch in range(epochs):
+            train_results = train(
+                model, train_loader, optimizer, criterion,
+                params['lambda_lasso'], params['lambda_group'], gene_groups, args
+            )
 
-    # average of metric on the k folds for 1 set of hyperparameters
-    return np.mean(scores_val)
+            # Validate the model
+            val_results = validate(model, val_loader, criterion, args)
+            val_loss = val_results['loss']
+            
+            # Check for improvement
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_epoch = epoch
+            else:
+                patience_counter += 1
 
+            # Early stopping
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                print(f"best epoch is {best_epoch}")
+                break
+          
+        fold_val_losses.append(best_val_loss)
+        best_epochs.append(best_epoch)
+        
+    # Compute the average validation loss and correlation across folds
+    avg_val_loss = sum(fold_val_losses) / len(fold_val_losses)
+    max_best_epoch = max(best_epochs)
+    trial.set_user_attr("max_best_epoch", max_best_epoch)
+
+    print(f"Best average validation loss: {avg_val_loss}")
+    
+    return avg_val_loss
 
 if __name__ == "__main__":
     pass

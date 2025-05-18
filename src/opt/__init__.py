@@ -1,1 +1,1 @@
-from .training_pipeline import train_model
+from .training_pipeline import objective

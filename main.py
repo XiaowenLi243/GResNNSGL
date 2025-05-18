@@ -1,10 +1,10 @@
 from torch.utils.data import SubsetRandomSampler, DataLoader,TensorDataset
-from GResNNSGL.utils import args
-from GResNNSGL.models import load_model
-from GResNNSGL.utils.load_data import load_data
-from GResNNSGL.utils.utils import compute_adaptive_weights
-from GResNNSGL.utils import *
-from GResNNSGL.opt.training_pipeline import train, validate, objective
+from src.utils import args
+from src.models import load_model
+from src.utils.load_data import load_data
+from src.utils.utils import compute_adaptive_weights
+from src.utils import *
+from src.opt.training_pipeline import train, validate, objective
 import optuna
 import torch.nn as nn
 import torch.optim as optim
